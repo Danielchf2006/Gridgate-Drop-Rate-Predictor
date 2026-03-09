@@ -1,0 +1,164 @@
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, classification_report, roc_auc_score
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+import pandas as pd
+import sqlite3
+import re
+import os
+
+# resolve all paths to the Datasets subfolder (where SQL and CSV live)
+DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Datasets")
+
+# load database
+
+with open(os.path.join(DIR, "Database_Engineer.SQL"), "r") as f:
+    sql_text = f.read()
+
+# Split on ; preserving comments so labels like [MODEL_DATA] are detectable
+raw_segments = [s.strip() for s in sql_text.split(";") if s.strip()]
+
+def strip_comments(sql):
+    return re.sub(r"--[^\n]*", "", sql).strip()
+
+create_stmt    = next(strip_comments(s) for s in raw_segments if "CREATE" in s.upper())
+county_stmt    = next(strip_comments(s) for s in raw_segments if s.upper().lstrip("-– \n").startswith("SELECT") and "[MODEL_DATA]" not in s)
+model_data_stmt = next(strip_comments(s) for s in raw_segments if "[MODEL_DATA]" in s)
+
+# connect to in-memory SQLite and create the table
+connect = sqlite3.connect(":memory:")
+connect.execute(create_stmt)
+
+# load csv into the SQL table
+
+raw = pd.read_csv(os.path.join(DIR, "GI_Interactive_Queue.csv"), skiprows=1)   # skip "Table 1" row
+raw.columns = [c.strip() for c in raw.columns]
+
+raw.rename(columns={
+    "Project #":                    "project_num",
+    "Request Status":               "request_status",
+    "Queue Date":                   "queue_date",
+    "Withdrawn Date":               "withdrawn_date",
+    "Done Date":                    "done_date",
+    "Appl In Service Date":         "appl_in_service_date",
+    "Transmission Owner":           "transmission_owner",
+    "County":                       "county",
+    "State":                        "state",
+    "Study Cycle":                  "study_cycle",
+    "Study Group":                  "study_group",
+    "Study Phase":                  "study_phase",
+    "Service Type":                 "service_type",
+    "POI Name":                     "poi_name",
+    "Summer MW":                    "summer_mw",
+    "Winter MW":                    "winter_mw",
+    "Fuel":                         "fuel",
+    "Generating Facility":          "generating_facility",
+    "Post GIA Status":              "post_gia_status",
+    "Negotiated In Service Date":   "negotiated_in_svc_date",
+    "Decision Point 1 ERIS MW":     "dp1_eris_mw",
+    "Decision Point 1 NRIS MW":     "dp1_nris_mw",
+    "Decision Point 2 ERIS MW":     "dp2_eris_mw",
+    "Decision Point 2 NRIS MW":     "dp2_nris_mw",
+}, inplace=True)
+
+raw.to_sql("gi_interactive_queue", connect, if_exists="replace", index=False)
+
+# county-level analysis (GROUP BY query from Database_Engineer.SQL)
+county_stats = pd.read_sql_query(county_stmt, connect)
+
+# per-project rows with duration variables (MODEL_DATA query from Database_Engineer.SQL)
+df = pd.read_sql_query(model_data_stmt, connect)
+
+print(f"Rows loaded from SQL query: {len(df)}")
+
+# Labeling
+#
+#  Withdrawal (binary)
+#     1 = Project withdrew from the queue
+#     0 = Project completed or still active
+
+#— Drop Round (multiclass)
+# 0 = Completes / Does Not Drop
+# Drops: Study Not Started, phase 1, phase2, phase 3, & GIA
+df["withdrawn"] = (
+    df["request_status"].str.strip().str.lower() == "withdrawn"
+).astype(int)
+
+print("\n── Label Distribution ────────────────────────────")
+print("Model 1 — Withdrawal:")
+print(df["withdrawn"].value_counts().rename({0: "Not Withdrawn", 1: "Withdrawn"}))
+
+
+#  Feature Engineering
+#  study_phase excluded from Model 2 since it's a snapshot at queue entry and may not be predictive of if a project drops
+
+df["queue_year"]  = pd.to_datetime(df["queue_date"], errors="coerce").dt.year
+df["queue_month"] = pd.to_datetime(df["queue_date"], errors="coerce").dt.month
+
+BASE_FEATURES = [
+    "queue_year",
+    "queue_month",
+    "transmission_owner",   # known upfront
+    "county",               # geographic
+    "state",                # geographic
+    "study_cycle",          # batch/cohort entered
+    "study_group",          # subgroup within cycle
+    "service_type",        
+    "summer_mw",            # capacity requested
+    "winter_mw",            # capacity requested
+    "fuel",                 # Solar, Wind, etc.
+    "generating_facility",  # facility identity
+    # duration variables (computed in Database_Engineer.SQL)
+    "days_in_queue",            # total time in queue — key drop signal
+    "planned_days_to_service",  # how far out they planned to be in service
+    "service_date_slip",        # how much the service date was pushed back
+]
+
+MODEL1_FEATURES = BASE_FEATURES + ["study_phase"] # include study_phase
+
+def prepare_X(df, feature_cols):
+    X = df[feature_cols].copy()
+    les = {}
+    # encode all string/categorical columns
+    for col in X.select_dtypes(include=["object", "str"]).columns:
+        le = LabelEncoder()
+        X[col] = le.fit_transform(X[col].fillna("Unknown").astype(str))
+        les[col] = le
+    # fill NaN in all remaining numeric columns (queue_year, queue_month, MW, etc.)
+    for col in X.select_dtypes(include="number").columns:
+        X[col] = X[col].fillna(0)
+    # scale all numeric columns so logistic regression converges properly
+    scaler = StandardScaler()
+    X = pd.DataFrame(scaler.fit_transform(X), columns=X.columns)
+    return X, les
+
+
+# model 1 - lbfgs failed to converge after 1000 iterations (didn't fully converge)
+# fine capturing the withdrawn project, but not the none withdrawn
+
+print("\n\n══ MODEL 1: Withdrawal Predictor (Binary) ════════")
+
+X1, les1 = prepare_X(df, MODEL1_FEATURES)
+y1 = df["withdrawn"]
+
+X1_train, X1_test, y1_train, y1_test = train_test_split(
+    X1, y1, test_size=0.2, random_state=42, stratify=y1
+)
+
+model1 = LogisticRegression(max_iter=5000, class_weight="balanced", random_state=42)
+model1.fit(X1_train, y1_train)
+y1_pred = model1.predict(X1_test)
+
+y1_prob = model1.predict_proba(X1_test)[:, 1]
+
+print(f"Accuracy : {accuracy_score(y1_test, y1_pred):.4f}")
+print(f"AUC-ROC  : {roc_auc_score(y1_test, y1_prob):.4f}")
+print(classification_report(y1_test, y1_pred,
+      target_names=["Not Withdrawn", "Withdrawn"]))
+
+coef1 = pd.DataFrame({
+    "feature":     MODEL1_FEATURES,
+    "coefficient": model1.coef_[0]
+}).sort_values("coefficient", key=abs, ascending=False)
+print("Top predictors (log-odds):")
+print(coef1.to_string(index=False))

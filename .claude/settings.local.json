@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(head -2 \"/Users/danielcai/Downloads/Gridgate Drop Rate Predictor Model/GI Interactive Queue \\(ALL MISO Projects, from their site\\).csv\")"
+    ]
+  }
+}
