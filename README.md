@@ -1,6 +1,6 @@
 ## GridGate Queue Withdrawal and Drop-Round Prediction
 The project creates two predictive models using data from the "GI_Interactive_Queue.csv" file, which is based on interconnection queue data, using features created by "Database_Engineer.SQL".
-The workflow involves loading raw data from a queue into an in-memory SQLite database, followed by a series of SQL-based data preprocessing and feature engineering steps, and then building a logistic regression model using Python with scikit-learn.
+The workflow involves loading raw data from a queue into an in-memory SQLite database, followed by a series of SQL-based data preprocessing and feature engineering steps, and then building a logistic regression model through Scikit-learn.
 
 ### Model 1 — Withdrawal Predictor (Binary Classification)
 Predicts whether a project will:
